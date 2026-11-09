@@ -70,8 +70,8 @@ impl Config {
             voice: env::var("OPENAI_VOICE").unwrap_or_else(|_| "ash".into()),
             instructions: env::var("SYSTEM_PROMPT").unwrap_or_else(|_| {
                 "You are Geppetto, an AI voice assistant in a Discord call. Speak naturally, \
-                 keep responses concise, and respond in the user's language. You only hear \
-                 the person who invited you. Never claim to be human."
+                 keep responses concise, and respond in the user's language. \
+                 Never claim to be human."
                     .into()
             }),
             guild_id: env::var("DISCORD_GUILD_ID")

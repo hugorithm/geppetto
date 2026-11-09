@@ -20,7 +20,9 @@ use tracing::{error, info, warn};
 struct Session {
     owner: UserId,
     channel: ChannelId,
+    text_channel: ChannelId,
     ssrc: Arc<AtomicU64>,
+    access: Arc<Mutex<SpeakerAccess>>,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -54,10 +56,43 @@ impl ReceiveHealth {
     }
 }
 
+struct SpeakerAccess {
+    owner: UserId,
+    bot: UserId,
+    everyone: bool,
+    speakers: HashMap<u32, UserId>,
+}
+
+impl SpeakerAccess {
+    fn allows(&self, ssrc: u32) -> bool {
+        self.speakers
+            .get(&ssrc)
+            .is_some_and(|user| *user != self.bot && (self.everyone || *user == self.owner))
+    }
+}
+
+fn mix_audio<'audio>(frames: impl Iterator<Item = &'audio [i16]>) -> Vec<i16> {
+    let mut mixed = vec![0_i32; INPUT_FRAMES * 2];
+    for frame in frames {
+        for (sample, incoming) in mixed.iter_mut().zip(frame) {
+            *sample += i32::from(*incoming);
+        }
+    }
+    mixed
+        .into_iter()
+        .map(|sample| sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+        .collect()
+}
+
+fn can_control(owner: UserId, actor: UserId, moderator: bool) -> bool {
+    owner == actor || moderator
+}
+
 #[derive(Clone)]
 struct Receive {
     owner: UserId,
     ssrc: Arc<AtomicU64>,
+    access: Arc<Mutex<SpeakerAccess>>,
     health: Arc<ReceiveHealth>,
     audio: mpsc::Sender<Vec<i16>>,
     cancel: CancellationToken,
@@ -71,6 +106,13 @@ impl songbird::EventHandler for Receive {
         }
         match event {
             EventContext::SpeakingStateUpdate(speaking) => {
+                if let Some(user) = speaking.user_id {
+                    self.access
+                        .lock()
+                        .await
+                        .speakers
+                        .insert(speaking.ssrc, UserId::new(user.0));
+                }
                 if speaking.user_id.map(|user| user.0) == Some(self.owner.get()) {
                     self.ssrc
                         .store(u64::from(speaking.ssrc) + 1, Ordering::Relaxed);
@@ -81,21 +123,18 @@ impl songbird::EventHandler for Receive {
                 }
             }
             EventContext::VoiceTick(tick) => {
-                let ssrc = self.ssrc.load(Ordering::Relaxed);
-                let frame = if ssrc > 0 {
-                    tick.speaking
-                        .get(&((ssrc - 1) as u32))
-                        .and_then(|voice| voice.decoded_voice.clone())
-                        .filter(|frame| !frame.is_empty())
-                } else {
-                    None
-                };
-                if let Some(frame) = &frame
-                    && self.health.record_frame(frame)
-                {
+                let access = self.access.lock().await;
+                let frames: Vec<_> = tick
+                    .speaking
+                    .iter()
+                    .filter(|(ssrc, _)| access.allows(**ssrc))
+                    .filter_map(|(_, voice)| voice.decoded_voice.as_deref())
+                    .filter(|frame| !frame.is_empty())
+                    .collect();
+                let frame = mix_audio(frames.iter().copied());
+                if !frames.is_empty() && self.health.record_frame(&frame) {
                     info!("Discord microphone audio received and decoded");
                 }
-                let frame = frame.unwrap_or_else(|| vec![0; INPUT_FRAMES * 2]);
                 if self.audio.try_send(frame).is_err() {
                     warn!("Voice input queue unavailable; stopping session");
                     self.cancel.cancel();
@@ -134,7 +173,7 @@ impl Bot {
                     })
                     .context("Join a voice channel first")?;
                 let resetting = command.data.name == "reset";
-                let ssrc = if let Some(session) = sessions.get(&guild_id) {
+                let (ssrc, access) = if let Some(session) = sessions.get(&guild_id) {
                     if !resetting {
                         bail!("I already have an active conversation in this server");
                     }
@@ -144,12 +183,20 @@ impl Bot {
                     if session.channel != channel {
                         bail!("Return to the conversation's voice channel first");
                     }
-                    session.ssrc.clone()
+                    (session.ssrc.clone(), session.access.clone())
                 } else {
                     if resetting {
                         bail!("There is no active conversation to reset");
                     }
-                    Arc::new(AtomicU64::new(0))
+                    (
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(Mutex::new(SpeakerAccess {
+                            owner: command.user.id,
+                            bot: ctx.cache.current_user().id,
+                            everyone: false,
+                            speakers: HashMap::new(),
+                        })),
+                    )
                 };
                 let socket = realtime::connect(&self.config).await.map_err(|error| {
                     error!(%error, "Could not start OpenAI voice");
@@ -158,9 +205,14 @@ impl Bot {
                 if let Some(session) = sessions.remove(&guild_id) {
                     session.stop().await;
                 }
+                let audience = if access.lock().await.everyone {
+                    "everyone in the channel's microphones are".to_string()
+                } else {
+                    format!("only <@{}>'s microphone is", command.user.id.get())
+                };
                 if command.channel_id.say(&ctx.http, format!(
-                    "Geppetto is joining <#{}>. AI-generated voice; only <@{}>'s microphone is sent to OpenAI. \
-                     Audio is not saved locally. /leave stops listening.", channel.get(), command.user.id.get()
+                    "Geppetto is joining <#{}>. AI-generated voice; {audience} sent to the AI provider. \
+                     Audio is not saved locally. /leave stops listening.", channel.get()
                 )).await.is_err() {
                     bail!("I need Send Messages here to announce that voice listening is starting");
                 }
@@ -171,6 +223,7 @@ impl Bot {
                 let handler = Receive {
                     owner: command.user.id,
                     ssrc: ssrc.clone(),
+                    access: access.clone(),
                     health: health.clone(),
                     audio,
                     cancel: cancel.clone(),
@@ -233,7 +286,9 @@ impl Bot {
                     Session {
                         owner: command.user.id,
                         channel,
+                        text_channel: command.channel_id,
                         ssrc,
+                        access,
                         cancel,
                         task,
                     },
@@ -245,7 +300,7 @@ impl Bot {
                 }
                 .into())
             }
-            "leave" => {
+            "listen" | "leave" => {
                 let session = sessions
                     .get(&guild_id)
                     .context("There is no active conversation")?;
@@ -254,8 +309,48 @@ impl Bot {
                     .as_ref()
                     .and_then(|member| member.permissions)
                     .is_some_and(|permissions| permissions.contains(Permissions::MANAGE_GUILD));
-                if session.owner != command.user.id && !moderator {
-                    bail!("Only the conversation owner or a server manager can disconnect me");
+                if !can_control(session.owner, command.user.id, moderator) {
+                    bail!(
+                        "Only the conversation owner or a server manager can change listening or disconnect me"
+                    );
+                }
+                if command.data.name == "listen" {
+                    let mode = command
+                        .data
+                        .options
+                        .iter()
+                        .find(|option| option.name == "mode")
+                        .and_then(|option| option.value.as_str())
+                        .context("Choose owner or everyone")?;
+                    let everyone = match mode {
+                        "owner" => false,
+                        "everyone" => true,
+                        _ => bail!("Choose owner or everyone"),
+                    };
+                    if session.access.lock().await.everyone == everyone {
+                        return Ok(format!("Listening mode is already {mode}."));
+                    }
+                    let notice = if everyone {
+                        format!(
+                            "Geppetto will now send everyone's microphone audio in <#{}> to the AI provider. Inform participants and obtain their consent. /listen mode:owner restores owner-only listening; /leave stops listening.",
+                            session.channel.get()
+                        )
+                    } else {
+                        format!(
+                            "Geppetto will now send only <@{}>'s microphone audio in <#{}> to the AI provider. Other participants are no longer forwarded.",
+                            session.owner.get(),
+                            session.channel.get()
+                        )
+                    };
+                    session
+                        .text_channel
+                        .say(&ctx.http, notice)
+                        .await
+                        .context("I need Send Messages to announce the listening change")?;
+                    session.access.lock().await.everyone = everyone;
+                    return Ok(format!(
+                        "Listening mode changed to {mode}. Conversation context is unchanged."
+                    ));
                 }
                 if let Some(session) = sessions.remove(&guild_id) {
                     session.stop().await;
@@ -280,6 +375,21 @@ impl EventHandler for Bot {
             CreateCommand::new("reset")
                 .description("Start a fresh voice conversation")
                 .dm_permission(false),
+            CreateCommand::new("listen")
+                .description(
+                    "Choose whose microphones are sent to the AI in the active conversation",
+                )
+                .dm_permission(false)
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "mode",
+                        "Who can speak with Geppetto",
+                    )
+                    .required(true)
+                    .add_string_choice("Only the person who used /join", "owner")
+                    .add_string_choice("Everyone in the voice channel", "everyone"),
+                ),
         ];
         let result = if let Some(guild_id) = self.config.guild_id {
             GuildId::new(guild_id)
@@ -382,12 +492,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn receive_only_maps_the_conversation_owner() {
+    async fn receive_tracks_owner_and_retains_other_speakers_for_mode_changes() {
         let (audio, _receiver) = mpsc::channel(1);
         let ssrc = Arc::new(AtomicU64::new(0));
         let handler = Receive {
             owner: UserId::new(42),
             ssrc: ssrc.clone(),
+            access: Arc::new(Mutex::new(SpeakerAccess {
+                owner: UserId::new(42),
+                bot: UserId::new(1),
+                everyone: false,
+                speakers: HashMap::new(),
+            })),
             health: Arc::new(ReceiveHealth::default()),
             audio,
             cancel: CancellationToken::new(),
@@ -404,6 +520,15 @@ mod tests {
         .unwrap();
         songbird::EventHandler::act(&handler, &EventContext::SpeakingStateUpdate(owner)).await;
         assert_eq!(ssrc.load(Ordering::Relaxed), 457);
+        {
+            let mut access = handler.access.lock().await;
+            assert!(access.allows(456));
+            assert!(!access.allows(123));
+            access.everyone = true;
+            assert!(access.allows(123));
+            access.everyone = false;
+            assert!(!access.allows(123));
+        }
         handler.cancel.cancel();
         let other = serde_json::from_value(serde_json::json!({
             "speaking": 1, "delay": 0, "ssrc": 789, "user_id": "42"
@@ -411,6 +536,52 @@ mod tests {
         .unwrap();
         songbird::EventHandler::act(&handler, &EventContext::SpeakingStateUpdate(other)).await;
         assert_eq!(ssrc.load(Ordering::Relaxed), 457);
+    }
+
+    #[test]
+    fn listening_mode_switches_known_speakers_and_excludes_bot_and_unknown_streams() {
+        let mut access = SpeakerAccess {
+            owner: UserId::new(42),
+            bot: UserId::new(1),
+            everyone: false,
+            speakers: HashMap::from([
+                (123, UserId::new(99)),
+                (456, UserId::new(42)),
+                (789, UserId::new(1)),
+            ]),
+        };
+        assert!(access.allows(456));
+        assert!(!access.allows(123));
+        access.everyone = true;
+        assert!(access.allows(123));
+        assert!(access.allows(456));
+        assert!(!access.allows(789));
+        assert!(!access.allows(999));
+        access.everyone = false;
+        assert!(!access.allows(123));
+        assert!(access.allows(456));
+    }
+
+    #[test]
+    fn mixed_audio_preserves_tick_duration_and_clamps_overlap() {
+        let first = [i16::MAX, i16::MIN, 1000, -1000];
+        let second = [1, -1, -500, 500];
+        let frame = mix_audio([first.as_slice(), second.as_slice()].into_iter());
+        assert_eq!(frame.len(), INPUT_FRAMES * 2);
+        assert_eq!(&frame[..4], &[i16::MAX, i16::MIN, 500, -500]);
+        assert!(frame[4..].iter().all(|sample| *sample == 0));
+        assert!(
+            mix_audio(std::iter::empty())
+                .iter()
+                .all(|sample| *sample == 0)
+        );
+    }
+
+    #[test]
+    fn only_owner_or_server_manager_can_control_listening() {
+        assert!(can_control(UserId::new(42), UserId::new(42), false));
+        assert!(can_control(UserId::new(42), UserId::new(99), true));
+        assert!(!can_control(UserId::new(42), UserId::new(99), false));
     }
 
     #[test]

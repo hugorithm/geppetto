@@ -51,8 +51,17 @@ headphones to prevent your microphone feeding the bot's voice back to it.
 | Command | Action |
 | --- | --- |
 | `/join` | Start listening to the invoking user's microphone in their voice channel. |
-| `/reset` | Start a fresh OpenAI conversation; only the conversation owner can do this. |
+| `/listen mode:everyone` | Listen to everyone in the active voice channel; available to the owner or a user with Manage Server. |
+| `/listen mode:owner` | Return to listening only to the person who used `/join`; same permissions. |
+| `/reset` | Start a fresh OpenAI conversation, preserving the listening mode; only the conversation owner can do this. |
 | `/leave` | Stop listening and disconnect; available to the owner or a user with Manage Server. |
+
+Every new `/join` starts in owner-only mode. `/listen` changes the current
+session immediately without reconnecting or clearing conversation context.
+Everyone mode mixes participant audio into one stream; it does not send
+Discord usernames or separate speaker identities to the model. The bot's own
+audio stream is excluded. Restart the bot to register new slash commands;
+global command propagation can take time.
 
 Only one conversation is active per server. Separate servers use separate
 sessions. The bot leaves when the owner leaves or moves channels, after five
@@ -62,10 +71,15 @@ use `/join` to reconnect. Reconnection and `/reset` start with fresh context.
 
 ## Privacy And Costs
 
-- Only the `/join` user's audio is forwarded. Other participants can hear the
-  response but their microphones are not sent to OpenAI. There is no group mode.
+- By default, only the `/join` user's audio is forwarded. In everyone mode,
+   microphones from other participants in the active voice channel are forwarded
+   too, including people who join later. Returning to owner mode stops forwarding
+   new audio from others; audio already queued or sent cannot be recalled.
 - The bot posts a visible AI/listening notice before joining and receiving audio.
-  Inform everyone in the call and obtain any consent required in your jurisdiction.
+   Listening-mode changes are announced in the text channel where the conversation
+   started; if the notice cannot be posted, the mode is not changed. Inform everyone
+   in the call and obtain any consent required in your jurisdiction before enabling
+   everyone mode.
 - Audio is buffered in memory, not recorded to disk. The bot does not log audio,
   transcripts, or credentials. Your chosen provider's data handling policies apply;
   Azure mode sends audio to your Azure resource, not the public OpenAI endpoint.
@@ -198,7 +212,8 @@ cargo test --all-targets
 ```
 
 Tests cover PCM conversion, resampling, stream shutdown, live Songbird decoding,
-speaker-ID filtering, Azure endpoint validation and authentication headers,
+speaker-ID filtering, listening-mode changes and authorization, overlapping audio
+mixing, Azure endpoint validation and authentication headers,
 deployment query encoding, and the Live and Realtime session payloads. They do not require
 credentials. Live Discord/OpenAI operation requires an end-to-end call with real
 credentials; compilation and local tests alone cannot validate network access,
