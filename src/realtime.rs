@@ -18,10 +18,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     audio::{DiscordResampler, PlaybackBuffer},
-    config::Config,
+    config::{Config, VoiceApi},
+    live,
 };
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub fn session_update(config: &Config) -> Value {
     json!({
@@ -89,14 +90,26 @@ async fn connect_inner(config: &Config) -> Result<Socket> {
                 anyhow::anyhow!(error)
             }
         })?;
-    send(&mut socket, session_update(config)).await?;
+    let (initial, ready) = match config.voice_api {
+        VoiceApi::Realtime => (session_update(config), "session.updated"),
+        VoiceApi::Live => (
+            live::session_start(
+                &config.model,
+                &config.voice,
+                &config.instructions,
+                &config.live_backend_model,
+            ),
+            "session.started",
+        ),
+    };
+    send(&mut socket, initial).await?;
     timeout(Duration::from_secs(15), async {
         while let Some(message) = socket.next().await {
             match message? {
                 Message::Text(text) => {
                     let event: Value = serde_json::from_str(&text)?;
                     match event["type"].as_str() {
-                        Some("session.updated") => return Ok(()),
+                        Some(event_type) if event_type == ready => return Ok(()),
                         Some("error") => bail!(
                             "OpenAI rejected session configuration (code {}, parameter {}): {}",
                             event["error"]["code"],
@@ -123,13 +136,21 @@ fn connection_request(
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     anyhow::ensure!(
         !config.model.trim().is_empty(),
-        "Realtime model or Azure deployment name cannot be empty"
+        "Voice model or Azure deployment name cannot be empty"
     );
-    let mut url = match &config.azure_endpoint {
-        Some(endpoint) => endpoint.clone(),
-        None => url::Url::parse("wss://api.openai.com/v1/realtime")?,
+    let mut url = match (config.voice_api, &config.azure_endpoint) {
+        (VoiceApi::Live, Some(endpoint)) => {
+            let mut url = endpoint.clone();
+            url.set_path("/openai/v1/live/sessions");
+            url
+        }
+        (VoiceApi::Live, None) => url::Url::parse("wss://api.openai.com/v1/live/sessions")?,
+        (VoiceApi::Realtime, Some(endpoint)) => endpoint.clone(),
+        (VoiceApi::Realtime, None) => url::Url::parse("wss://api.openai.com/v1/realtime")?,
     };
-    url.query_pairs_mut().append_pair("model", &config.model);
+    if config.voice_api == VoiceApi::Realtime {
+        url.query_pairs_mut().append_pair("model", &config.model);
+    }
     let mut request = url.as_str().into_client_request()?;
     if config.azure_endpoint.is_some() {
         request
@@ -144,7 +165,7 @@ fn connection_request(
     Ok(request)
 }
 
-async fn send(socket: &mut Socket, event: Value) -> Result<()> {
+pub(crate) async fn send(socket: &mut Socket, event: Value) -> Result<()> {
     timeout(
         Duration::from_secs(5),
         socket.send(Message::Text(event.to_string().into())),
@@ -174,7 +195,11 @@ pub async fn run(
     call: Arc<Mutex<Call>>,
     mut audio: mpsc::Receiver<Vec<i16>>,
     cancel: CancellationToken,
+    voice_api: VoiceApi,
 ) -> Result<()> {
+    if voice_api == VoiceApi::Live {
+        return live::run(socket, call, audio, cancel).await;
+    }
     let mut resampler = DiscordResampler::new()?;
     let mut playback: Option<Playback> = None;
     let mut interrupted_item: Option<String> = None;
@@ -276,6 +301,8 @@ mod tests {
             discord_token: String::new(),
             openai_key: String::new(),
             model: "gpt-realtime".into(),
+            voice_api: VoiceApi::Realtime,
+            live_backend_model: "gpt-6-luna".into(),
             azure_endpoint: None,
             voice: "marin".into(),
             instructions: "Be concise".into(),
@@ -295,6 +322,8 @@ mod tests {
             discord_token: String::new(),
             openai_key: "test-key".into(),
             model: "my-voice-deployment".into(),
+            voice_api: VoiceApi::Realtime,
+            live_backend_model: "gpt-6-luna".into(),
             azure_endpoint: azure.then(|| {
                 url::Url::parse("wss://example.openai.azure.com/openai/v1/realtime").unwrap()
             }),
@@ -324,6 +353,44 @@ mod tests {
         assert_eq!(request.uri().host(), Some("api.openai.com"));
         assert_eq!(request.headers()["Authorization"], "Bearer test-key");
         assert!(!request.headers().contains_key("api-key"));
+    }
+
+    #[test]
+    fn live_request_uses_public_live_endpoint_without_query_or_azure_key_header() {
+        let mut config = connection_config(false);
+        config.voice_api = VoiceApi::Live;
+        let request = connection_request(&config).unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://api.openai.com/v1/live/sessions"
+        );
+        assert_eq!(request.headers()["Authorization"], "Bearer test-key");
+        assert!(!request.headers().contains_key("api-key"));
+    }
+
+    #[test]
+    fn azure_live_request_uses_resource_endpoint_and_api_key_without_query() {
+        let mut config = connection_config(true);
+        config.voice_api = VoiceApi::Live;
+        config.live_backend_model = "my-responses-deployment".into();
+        let request = connection_request(&config).unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://example.openai.azure.com/openai/v1/live/sessions"
+        );
+        assert_eq!(request.headers()["api-key"], "test-key");
+        assert!(!request.headers().contains_key("Authorization"));
+        let event = live::session_start(
+            &config.model,
+            &config.voice,
+            &config.instructions,
+            &config.live_backend_model,
+        );
+        assert_eq!(event["session"]["model"], "my-voice-deployment");
+        assert_eq!(
+            event["session"]["delegation"]["responses"]["model"],
+            "my-responses-deployment"
+        );
     }
 
     #[test]

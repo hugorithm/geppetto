@@ -5,7 +5,7 @@
 </p>
 
 A Rust Discord bot for live voice conversations with GPT. Join a server voice
-channel, run `/join`, and speak. The bot streams your voice to OpenAI Realtime
+channel, run `/join`, and speak. The bot streams your voice to OpenAI Live or Realtime
 and streams its spoken response back into Discord. You can interrupt it while
 it speaks, and the conversation retains context until reset or disconnected.
 
@@ -77,6 +77,36 @@ use `/join` to reconnect. Reconnection and `/reset` start with fresh context.
 
 ## Configuration
 
+### Azure OpenAI Live (gpt-live-1)
+
+Deploy `gpt-live-1` and a Responses API backend model in your Azure resource,
+then set their actual deployment names:
+
+```dotenv
+VOICE_API=live
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_API_KEY=your-resource-key
+AZURE_OPENAI_DEPLOYMENT_NAME=your-gpt-live-1-deployment
+AZURE_OPENAI_LIVE_BACKEND_DEPLOYMENT_NAME=your-responses-deployment
+OPENAI_VOICE=ash
+```
+
+Live connects to your Azure resource's `/openai/v1/live/sessions` endpoint
+using the `api-key` header. Both deployment names are sent in `session.start`,
+not URL query parameters. The backend deployment must support the Responses API
+(for example, a deployment of `gpt-6-luna`). Direct OpenAI model settings and its
+key are ignored when the Azure endpoint is set. The bot finalizes Live sessions
+before disconnecting. Azure Live has local protocol tests but has not been
+verified against the provider with real credentials. Run the session check below
+before joining Discord.
+
+See [Microsoft's GPT-Live WebSocket guide](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/gpt-live)
+and [Responses delegation guide](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/gpt-live-delegation).
+
+Set `VOICE_API=realtime` (the default when unset) to retain the existing direct
+OpenAI or Azure Realtime integration. Live and Realtime use separate session
+and audio event protocols; do not put `gpt-live-1` in `OPENAI_REALTIME_MODEL`.
+
 ### Azure OpenAI
 
 Set these values in your local configuration:
@@ -90,12 +120,13 @@ AZURE_OPENAI_DEPLOYMENT_NAME=your-voice-deployment
 Use your actual **deployment name**, not necessarily the underlying model ID.
 Deploy a conversational speech-to-speech Realtime model such as `gpt-realtime-2.1`
 if available in your Azure region. Chat-only, transcription, translation, and
-`gpt-live-1` deployments are not compatible with this bot's Realtime conversation
-protocol. Public OpenAI model availability and pricing do not establish Azure
+`gpt-live-1` deployments are not compatible with the Realtime conversation
+protocol; use `VOICE_API=live` and the configuration above for `gpt-live-1`.
+Public OpenAI model availability and pricing do not establish Azure
 availability or pricing; check your Foundry deployment and Azure pricing.
 
-A nonempty `AZURE_OPENAI_ENDPOINT` enables Azure mode. `OPENAI_API_KEY` and
-`OPENAI_REALTIME_MODEL` are then ignored, and the Azure key and deployment are
+A nonempty `AZURE_OPENAI_ENDPOINT` enables Azure mode for either voice protocol.
+Direct OpenAI keys and model settings are then ignored, and the Azure key and deployment are
 required. The endpoint must be the HTTPS resource root or its `/openai/v1` base
 URL, not a chat-completions or deployment-specific URL. The bot connects to:
 
@@ -113,11 +144,17 @@ See [Microsoft's Azure Realtime WebSocket guide](https://learn.microsoft.com/en-
 
 ### Direct OpenAI And Shared Settings
 
-Leave `AZURE_OPENAI_ENDPOINT` empty to use direct OpenAI.
+Set `VOICE_API=realtime` and leave `AZURE_OPENAI_ENDPOINT` empty to use direct
+OpenAI Realtime.
 `OPENAI_REALTIME_MODEL` defaults to `gpt-realtime-2.1`; select another compatible
 Realtime model your API project can access. `OPENAI_VOICE` defaults to `ash`.
 `SYSTEM_PROMPT` controls the assistant's speaking style. Environment variables
 override values loaded from `.env`. Credentials are validated on startup.
+
+For direct OpenAI Live, leave the Azure endpoint empty and set `VOICE_API=live`,
+`OPENAI_API_KEY`, `OPENAI_LIVE_MODEL` (default `gpt-live-1`), and
+`OPENAI_LIVE_BACKEND_MODEL` (default `gpt-6-luna`). These model settings are
+only used without an Azure endpoint.
 
 The bot supports server voice channels, not direct-message or group-DM calls.
 Speaker overlap, loud rooms, and microphone echo affect turn detection.
@@ -147,7 +184,8 @@ sending microphone audio, run:
 cargo run --example check_voice
 ```
 
-The check opens and immediately closes a provider session; provider billing rules
+The check opens and immediately closes the selected provider session, waiting
+for finalization in Live mode; provider billing rules
 still apply. Rejected settings report the provider's error code, parameter, and
 message with configured credentials redacted. Available voices depend on your
 deployment; `spruce` was rejected by the tested Azure `gpt-realtime-2.1-mini`
@@ -161,7 +199,7 @@ cargo test --all-targets
 
 Tests cover PCM conversion, resampling, stream shutdown, live Songbird decoding,
 speaker-ID filtering, Azure endpoint validation and authentication headers,
-deployment query encoding, and the Realtime session payload. They do not require
+deployment query encoding, and the Live and Realtime session payloads. They do not require
 credentials. Live Discord/OpenAI operation requires an end-to-end call with real
 credentials; compilation and local tests alone cannot validate network access,
 server permissions, model availability, or audible call quality.

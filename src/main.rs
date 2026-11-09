@@ -193,6 +193,7 @@ impl Bot {
                     );
                 }
                 let worker_cancel = cancel.clone();
+                let voice_api = self.config.voice_api;
                 let http = ctx.http.clone();
                 let text_channel = command.channel_id;
                 let monitor_ssrc = ssrc.clone();
@@ -211,7 +212,9 @@ impl Bot {
                             }
                         }
                     });
-                    let result = realtime::run(socket, call, receiver, worker_cancel.clone()).await;
+                    let result =
+                        realtime::run(socket, call, receiver, worker_cancel.clone(), voice_api)
+                            .await;
                     worker_cancel.cancel();
                     let _ = monitor.await;
                     if result.is_err() {

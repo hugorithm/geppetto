@@ -1,5 +1,8 @@
 use anyhow::Result;
-use geppetto::{config::Config, realtime};
+use geppetto::{
+    config::{Config, VoiceApi},
+    live, realtime,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,6 +13,9 @@ async fn main() -> Result<()> {
         config.model, config.voice
     );
     let mut socket = realtime::connect(&config).await?;
+    if config.voice_api == VoiceApi::Live {
+        live::close(&mut socket).await?;
+    }
     socket.close(None).await?;
     println!("Voice session accepted. Connection closed without sending microphone audio.");
     Ok(())

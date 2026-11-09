@@ -3,10 +3,28 @@ use std::env;
 use anyhow::{Context, Result, ensure};
 use url::Url;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceApi {
+    Realtime,
+    Live,
+}
+
+impl VoiceApi {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "realtime" => Ok(Self::Realtime),
+            "live" => Ok(Self::Live),
+            _ => anyhow::bail!("VOICE_API must be realtime or live"),
+        }
+    }
+}
+
 pub struct Config {
     pub discord_token: String,
     pub openai_key: String,
     pub model: String,
+    pub voice_api: VoiceApi,
+    pub live_backend_model: String,
     pub azure_endpoint: Option<Url>,
     pub voice: String,
     pub instructions: String,
@@ -15,6 +33,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let voice_api = VoiceApi::parse(&env::var("VOICE_API").unwrap_or_default())?;
         let azure_endpoint = env::var("AZURE_OPENAI_ENDPOINT")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -25,16 +44,28 @@ impl Config {
                 required("AZURE_OPENAI_API_KEY")?,
                 required("AZURE_OPENAI_DEPLOYMENT_NAME")?,
             )
+        } else if voice_api == VoiceApi::Live {
+            (
+                required("OPENAI_API_KEY")?,
+                nonempty_or_default("OPENAI_LIVE_MODEL", "gpt-live-1"),
+            )
         } else {
             (
                 required("OPENAI_API_KEY")?,
                 env::var("OPENAI_REALTIME_MODEL").unwrap_or_else(|_| "gpt-realtime-2.1".into()),
             )
         };
+        let live_backend_model = if voice_api == VoiceApi::Live && azure_endpoint.is_some() {
+            required("AZURE_OPENAI_LIVE_BACKEND_DEPLOYMENT_NAME")?
+        } else {
+            nonempty_or_default("OPENAI_LIVE_BACKEND_MODEL", "gpt-6-luna")
+        };
         Ok(Self {
             discord_token: required("DISCORD_TOKEN")?,
             openai_key,
             model,
+            voice_api,
+            live_backend_model,
             azure_endpoint,
             voice: env::var("OPENAI_VOICE").unwrap_or_else(|_| "ash".into()),
             instructions: env::var("SYSTEM_PROMPT").unwrap_or_else(|_| {
@@ -54,6 +85,13 @@ impl Config {
                 .transpose()?,
         })
     }
+}
+
+fn nonempty_or_default(name: &str, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.into())
 }
 
 fn parse_azure_endpoint(endpoint: &str) -> Result<Url> {
@@ -89,6 +127,13 @@ fn required(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_api_selection_defaults_to_realtime() {
+        assert_eq!(VoiceApi::parse("").unwrap(), VoiceApi::Realtime);
+        assert_eq!(VoiceApi::parse("live").unwrap(), VoiceApi::Live);
+        assert!(VoiceApi::parse("unknown").is_err());
+    }
 
     #[test]
     fn azure_endpoint_normalizes_resource_and_v1_urls() {
