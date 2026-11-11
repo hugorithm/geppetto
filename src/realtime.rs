@@ -50,10 +50,10 @@ pub fn session_update(config: &Config) -> Value {
 pub async fn connect(config: &Config) -> Result<Socket> {
     connect_inner(config)
         .await
-        .map_err(|error| anyhow::anyhow!(safe_connection_error(&error, config)))
+        .map_err(|error| anyhow::anyhow!(safe_error_message(&error, config)))
 }
 
-fn safe_connection_error(error: &anyhow::Error, config: &Config) -> String {
+pub fn safe_error_message(error: &anyhow::Error, config: &Config) -> String {
     let mut message = format!("{error:#}");
     for secret in [&config.openai_key, &config.discord_token] {
         if !secret.is_empty() {
@@ -415,7 +415,7 @@ mod tests {
             config.discord_token
         )
         .context("Session setup failed");
-        let message = safe_connection_error(&error, &config);
+        let message = safe_error_message(&error, &config);
         assert!(message.contains("Session setup failed: Rejected voice"));
         assert!(!message.contains(&config.openai_key));
         assert!(!message.contains(&config.discord_token));

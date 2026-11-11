@@ -247,6 +247,7 @@ impl Bot {
                 }
                 let worker_cancel = cancel.clone();
                 let voice_api = self.config.voice_api;
+                let worker_config = self.config.clone();
                 let http = ctx.http.clone();
                 let text_channel = command.channel_id;
                 let monitor_ssrc = ssrc.clone();
@@ -270,8 +271,8 @@ impl Bot {
                             .await;
                     worker_cancel.cancel();
                     let _ = monitor.await;
-                    if result.is_err() {
-                        error!(%guild_id, "Voice session failed; check OpenAI billing, limits, and network");
+                    if let Err(error) = &result {
+                        error!(%guild_id, error = %realtime::safe_error_message(error, &worker_config), "Voice session failed");
                     }
                     let _ = manager.remove(guild_id).await;
                     let notice = if result.is_err() {
