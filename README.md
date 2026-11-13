@@ -61,7 +61,10 @@ session immediately without reconnecting or clearing conversation context.
 Everyone mode mixes participant audio into one stream; it does not send
 Discord usernames or separate speaker identities to the model. The bot's own
 audio stream is excluded. Restart the bot to register new slash commands;
-global command propagation can take time.
+global command propagation can take time. With `DISCORD_GUILD_ID` empty, startup
+also removes matching server-specific commands from connected servers after
+global registration succeeds, preventing duplicate entries when switching from
+server-specific registration. Cleanup failures are logged; restart to retry.
 
 Only one conversation is active per server. Separate servers use separate
 sessions. The bot leaves when the owner leaves or moves channels, after five

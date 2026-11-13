@@ -400,8 +400,34 @@ impl EventHandler for Bot {
             Command::set_global_commands(&ctx.http, commands).await
         };
         match result {
-            Ok(_) => info!(user = %ready.user.name, "Bot ready; slash commands registered"),
-            Err(_) => error!("Could not register slash commands; check application permissions"),
+            Ok(registered) => {
+                if self.config.guild_id.is_none() {
+                    for guild in &ready.guilds {
+                        let cleanup = async {
+                            let commands = guild.id.get_commands(&ctx.http).await?;
+                            for command in commands {
+                                if registered.iter().any(|global| global.name == command.name) {
+                                    guild.id.delete_command(&ctx.http, command.id).await?;
+                                    info!(guild_id = %guild.id, command = %command.name,
+                                        "Removed duplicate server slash command");
+                                }
+                            }
+                            Ok::<_, serenity::Error>(())
+                        }
+                        .await;
+                        if let Err(error) = cleanup {
+                            error!(guild_id = %guild.id,
+                                error = %realtime::safe_error_message(&error.into(), &self.config),
+                                "Could not remove duplicate server slash commands; restart to retry");
+                        }
+                    }
+                }
+                info!(user = %ready.user.name, "Bot ready; slash commands registered");
+            }
+            Err(error) => error!(
+                error = %realtime::safe_error_message(&error.into(), &self.config),
+                "Could not register slash commands; check application permissions"
+            ),
         }
     }
 
